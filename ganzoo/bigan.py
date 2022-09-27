@@ -6,6 +6,8 @@ os.environ['NO_GCE_CHECK'] = 'true'
 
 import sys
 from datetime import datetime
+from absl import app, logging
+logging.set_verbosity(logging.DEBUG)
 
 import numpy as np
 from PIL import Image
@@ -22,6 +24,7 @@ from tensorflow.keras.datasets import mnist
 
 
 class BiGAN(Model):
+    """Invariant MNIST BiGAN."""
     def __init__(self, name='BiGAN', **kwargs):
         super().__init__(name=name, **kwargs)
         # Image size
@@ -35,8 +38,10 @@ class BiGAN(Model):
         self.epochs = 400
         # Init learning rate
         self.lr = 1e-4
+
+        # Working directory configuration
         timeshift = datetime.today().strftime('%Y%m%d-%H:%M:%S')
-        self.workdir = 'exps/' + f'BiGAN/f{timeshift}'
+        self.workdir = 'exps/' + f'{name}/f{timeshift}'
         self.logdir = os.path.join(self.workdir, 'logs')
         self.imgdir = os.path.join(self.workdir, 'imgs/')
 
@@ -264,17 +269,7 @@ def build_discriminator(
     )(y)
     return Model([x, z], [y], name='discriminator')
 
-def get_mnist():
-    """TODO: Doubt there is a bug on shuffling, but model.fit()
-    should do it by default."""
-    (x_train, y_train), (x_test, y_test) = mnist.load_data()
-
-    x_train = np.reshape(x_train, (-1, 28*28*1))
-    x_train = (x_train.astype("float32") / 255) * 2 - 1
-
-    return x_train
-
-def get_tfds_mnist(data_dir='./data', batch_size=128):
+def get_tfds_mnist(data_dir='../data', batch_size=128):
     def norm_and_remove(img, label):
         """Normalize to [-1, 1] and Remove label
 
@@ -310,10 +305,17 @@ def get_tfds_mnist(data_dir='./data', batch_size=128):
 
     return (ds_train, ds_test)
 
-if __name__ == '__main__':
+@app.run
+def main(argv):
+    """Main procedure."""
+    del argv
+
     model = BiGAN()
 
-    x_train, _ = get_tfds_mnist(batch_size=model.batch_size)
+    x_train, _ = get_tfds_mnist(
+        data_dir='../data',
+        batch_size=model.batch_size
+    )
 
     model.compile()
 
