@@ -305,7 +305,6 @@ def get_tfds_mnist(data_dir='../data', batch_size=128):
 
     return (ds_train, ds_test)
 
-@app.run
 def main(argv):
     """Main procedure."""
     del argv
@@ -324,3 +323,6 @@ def main(argv):
         epochs=model.epochs,
         callbacks=model.callbacks,
     )
+
+if __name__ == '__main__':
+    app.run(main)

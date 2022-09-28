@@ -26,3 +26,9 @@ pytest = "^7.1.3"
 addopts = [
     "--import-mode=importlib",
 ]
+testpaths = [
+    "tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
