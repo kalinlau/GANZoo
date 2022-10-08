@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# pylint: disable=ungrouped-imports
 
 """Bidirectional Conditional GANs."""
 
@@ -128,11 +130,6 @@ class BiCoGAN(Model):
         self.d_loss_metric = keras.metrics.Mean(name='d_loss')
         self.e_loss_metric = keras.metrics.Mean(name='e_loss')
         self.lr_metric = Monitor(name='lr')
-
-    # def compile(self, **kwargs):
-    #     """Compile static computational graph.
-    #     """
-    #     super().compile(**kwargs)
 
     @property
     def metrics(self):
@@ -526,7 +523,7 @@ def run(argv):
 
     bicogan = BiCoGAN()
 
-    ds_train, _ = get_mnist(data_dir='../data')
+    ds_train, _ = get_mnist(batch_size=bicogan.batch_size)
 
     bicogan.compile(
         run_eagerly=False,
