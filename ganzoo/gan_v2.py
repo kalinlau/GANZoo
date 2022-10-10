@@ -12,15 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
 
-
-"""Deep Convolutional Generative Adversarial Network"""
+"""Vanilla GANs. Trained by binary cross entropy with artifactual labels"""
 
 import os
 import math
 
 from datetime import datetime
-from absl import logging, flags
+from absl import logging
 
 import numpy as np
 from PIL import Image
@@ -36,32 +36,27 @@ except ImportError:
     # Script import
     from context import _DATADIR, _WORKDIR, main
 
-FLAGS = flags.FLAGS
-FLAGS.alsologtostderr = True
 
-flags.DEFINE_boolean(
-    'run_eagerly', False, 'Run in Eager mode to debug. (Default: False)',
-)
-
-
-class DCGAN(keras.Model):
-    """DCGAN from https://arxiv.org/abs/1511.06434"""
-    def __init__(self, name='dcgan', **kwargs):
+class GAN(keras.Model):
+    """Generative Adversarial Networks (BCE version)
+    """
+    def __init__(self, name='gan_v2', **kwargs):
         super().__init__(name=name, **kwargs)
-        # Image
+        # Image size
         self.h, self.w, self.c = 28, 28, 1
-        self.img_shape = (self.h, self.w, self.c)
+        self.img_shape = self.h * self.w * self.c
 
         # Training details
-        self.batch_size = 64
-        self.epochs = 40
         self.lr = 1e-4
-        self.z_dim = 100
-        self.beta_1 = 0.5
+        self.epochs = 50
+        self.batch_size = 32
 
-        # Model
-        self.generator = build_generator(self.z_dim)
-        self.discriminator = build_discriminator(self.img_shape)
+        # Latent dim
+        self.z_dim = 100
+
+        # Build models
+        self.generator = build_generator(self.img_shape, self.z_dim)
+        self.discriminator = build_discriminator(self.img_shape, self.z_dim)
 
         # Working directory
         timeshift = datetime.today().strftime('%Y%m%d-%H:%M:%S')
@@ -87,7 +82,6 @@ class DCGAN(keras.Model):
             json_file.write(gjson)
             json_file.write(djson)
 
-
         # Keras Callbacks.
         self.callbacks = [
             SaveImage(workdir=self.imgdir, latent_dim=self.z_dim, interval=2),
@@ -95,21 +89,22 @@ class DCGAN(keras.Model):
             keras.callbacks.TensorBoard(log_dir=self.logdir),
         ]
 
-        # Optimziers
+        # Optimizer
         self.d_optimizer = keras.optimizers.Adam(
-            learning_rate= self.lr, beta_1=self.beta_1
+            learning_rate=self.lr, beta_1=0.5, beta_2=0.999
         )
         self.g_optimizer = keras.optimizers.Adam(
-            learning_rate= self.lr, beta_1=self.beta_1
+            learning_rate=self.lr, beta_1=0.5, beta_2=0.999
         )
 
-        # Metric monitor
+        # Loss
+        self.loss_fn = keras.losses.BinaryCrossentropy(from_logits=False)
+
+        # Metric
         self.d_loss_metric = keras.metrics.Mean(name='d_loss')
         self.g_loss_metric = keras.metrics.Mean(name='g_loss')
         self.lr_metric = Monitor(name='d_lr')
 
-        # Loss
-        self.loss_fn = keras.losses.BinaryCrossentropy(from_logits=False)
 
     @property
     def metrics(self):
@@ -118,13 +113,55 @@ class DCGAN(keras.Model):
             self.lr_metric,
         ]
 
-    def train_step(self, data):
-        """One step train function.
+    # def train_step(self, data):
+    #     imgs = data
 
-        Use binary cross entropy with noise trick.
-        """
+    #     batch_size = tf.shape(imgs)[0]
+    #     img = tf.reshape(imgs, shape=(batch_size, -1), name='flat_img')
+    #     z = tf.random.uniform(
+    #         shape=(batch_size, self.z_dim),
+    #         minval=-1,
+    #         maxval=1.,
+    #         dtype=tf.float32,
+    #     )
+
+    #     img_ = self.generator(z)
+
+    #     with tf.GradientTape(persistent=True) as tape:
+    #         d_ins = tf.concat([img_, img], 0)
+    #         d_outs = self.discriminator(d_ins)
+    #         dg, dx = tf.split(d_outs, num_or_size_splits=2, axis=0)
+
+    #         d_loss = tf.reduce_mean(tf.math.softplus(dg)) \
+    #             + tf.reduce_mean(tf.math.softplus(-dx))
+    #         g_loss = tf.reduce_mean(tf.math.softplus(-dg))
+
+    #     d_gradients = tf.gradients(
+    #         d_loss, self.discriminator.trainable_variables
+    #     )
+    #     g_gradients = tf.gradients(
+    #         g_loss, self.generator.trainable_variables
+    #     )
+
+    #     self.d_optimizer.apply_gradients(
+    #         zip(d_gradients, self.discriminator.trainable_variables)
+    #     )
+    #     self.g_optimizer.apply_gradients(
+    #         zip(g_gradients, self.generator.trainable_variables)
+    #     )
+
+    #     self.d_loss_metric.update_state(d_loss)
+    #     self.g_loss_metric.update_state(g_loss)
+    #     self.lr_metric.update_state(self.d_optimizer.learning_rate)
+
+    #     return {'d_loss': self.d_loss_metric.result(),
+    #             'g_loss': self.g_loss_metric.result(),
+    #             'd_lr':self.lr_metric.result(),}
+
+    def train_step(self, data):
         img = data
         batch_size = tf.shape(img)[0]
+        img = tf.reshape(img, shape=(batch_size, -1), name='flat_img')
 
         # Train Discriminator
         z = tf.random.normal(shape=(batch_size, self.z_dim))
@@ -163,7 +200,6 @@ class DCGAN(keras.Model):
             zip(g_grad, self.generator.trainable_weights)
         )
 
-        # Update monitor metrics.
         self.d_loss_metric.update_state(dloss)
         self.g_loss_metric.update_state(gloss)
         self.lr_metric.update_state(self.d_optimizer.learning_rate)
@@ -174,160 +210,60 @@ class DCGAN(keras.Model):
         }
 
 
-def build_generator(z_dim):
-    """Build Generator network.
-
-    Use tanh to restrict logits to [-1, 1].
-    """
-    # Backup architecture
-    # z = keras.layers.Input(shape=z_dim)
-    # y = keras.layers.Dense(7 * 7 * z_dim)(z)
-    # y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    # y = keras.layers.Reshape((7, 7, z_dim))(y)
-    # y = keras.layers.Conv2DTranspose(
-    #     128, kernel_size=4, strides=2, padding='same'
-    # )(y)
-    # y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    # y = keras.layers.Conv2DTranspose(
-    #     128, kernel_size=4, strides=2, padding='same'
-    # )(y)
-    # y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    # y = keras.layers.Conv2D(
-    #     1, kernel_size=7, padding='same', activation='sigmoid',
-    # )(y)
-
-    # Backup arch 2: infoGAN
-    # z = keras.layers.Input(shape=(z_dim,))
-    # y = keras.layers.Dense(1024)(z)
-    # y = keras.layers.BatchNormalization(epsilon=1e-5)(y)
-    # y = keras.layers.ReLU()(y)
-    # y = keras.layers.Dense(7 * 7 * 128)(y)
-    # y = keras.layers.BatchNormalization(epsilon=1e-5)(y)
-    # y = keras.layers.ReLU()(y)
-    # y = keras.layers.Reshape((7, 7, 128))(y)
-    # y = keras.layers.Conv2DTranspose(64, (4,4), (2,2), padding='same')(y)
-    # y = keras.layers.BatchNormalization(epsilon=1e-5)(y)
-    # y = keras.layers.ReLU()(y)
-    # y = keras.layers.Conv2DTranspose(
-    #     1, (4,4), (2,2), padding='same', activation='sigmoid'
-    # )(y)
-    z = keras.layers.Input(shape=z_dim)
+def build_generator(
+        img_shape,
+        z_dim,
+    ):
+    """Generator Network"""
+    x = keras.layers.Input(z_dim)
     y = keras.layers.Dense(
-        128 * 7 * 7, activation='relu'
-    )(z)
-    y = keras.layers.Reshape((7, 7, 128))(y)
-    y = keras.layers.UpSampling2D()(y)
-    y = keras.layers.Conv2D(
-        128, kernel_size=3, padding='same'
-    )(y)
-    y = keras.layers.BatchNormalization(momentum=0.8)(y)
+        256,
+        # kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        # kernel_regularizer=reg(),
+    )(x)
     y = keras.layers.ReLU()(y)
-    y = keras.layers.UpSampling2D()(y)
-    y = keras.layers.Conv2D(
-        64, kernel_size=3, padding='same'
+    y = keras.layers.Dense(
+        512,
+        # kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        # kernel_regularizer=reg(),
     )(y)
-    y = keras.layers.BatchNormalization(momentum=0.8)(y)
     y = keras.layers.ReLU()(y)
-    y = keras.layers.Conv2D(
-        1, kernel_size=3, padding='same', activation='tanh'
+    y = keras.layers.BatchNormalization()(y)
+    y = keras.layers.Dense(
+        img_shape,
+        # kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        # kernel_regularizer=reg(),
+        activation='tanh',
     )(y)
+    return keras.Model(x, y, name='generator')
 
-    return keras.Model(z, y, name='generator')
-
-def build_discriminator(img_shape):
-    # img = keras.layers.Input(shape=img_shape) # (H, W, C)
-    # y = keras.layers.Conv2D(
-    #     64, kernel_size=4, strides=2, padding="same")(img)
-    # y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    # y = keras.layers.Conv2D(
-    #     128, kernel_size=4, strides=2, padding="same")(y)
-    # y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    # y = keras.layers.GlobalMaxPooling2D()(y)
-    # y = keras.layers.Dense(1, activation="sigmoid")(y)
-
-    # Same architecture with infoGAN
-    # img = keras.layers.Input(shape=img_shape)
-    # y = keras.layers.Conv2D(64, (4,4), (2,2), padding='same')(img)
-    # y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    # y = keras.layers.Conv2D(128, (4,4), (2,2), padding='same')(y)
-    # y = keras.layers.BatchNormalization(epsilon=1e-5)(y)
-    # y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    # y = keras.layers.Flatten()(y)
-    # y = keras.layers.Dense(1024)(y)
-    # y = keras.layers.BatchNormalization(epsilon=1e-5)(y)
-    # y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    # y = keras.layers.Dense(1, activation='sigmoid')(y)
-    img = keras.layers.Input(shape=img_shape) # (H, W, C)
-    y = keras.layers.Conv2D(
-        32, kernel_size=3, strides=2, padding='same'
-    )(img)
+def build_discriminator(
+        img_shape,
+        z_dim,
+    ):
+    """Discriminator Network"""
+    del z_dim
+    x = keras.layers.Input(img_shape)
+    y = keras.layers.Dense(
+        512,
+        # kernel_initializer=RandomNormal(mean=0.0, stddev=0.5),
+        # kernel_regularizer=reg(),
+    )(x)
     y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    y = keras.layers.Dropout(0.25)(y)
-    y = keras.layers.Conv2D(
-        64, kernel_size=3, strides=2, padding='same'
+    y = keras.layers.Dense(
+        256,
+        # kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        # kernel_regularizer=reg(),
     )(y)
-    y = keras.layers.ZeroPadding2D(padding=((0, 1), (0, 1)))(y)
-    y = keras.layers.BatchNormalization(momentum=0.8)(y)
     y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    y = keras.layers.Dropout(0.25)(y)
-    y = keras.layers.Conv2D(
-        128, kernel_size=3, strides=2, padding='same'
+    y = keras.layers.BatchNormalization()(y)
+    y = keras.layers.Dense(
+        1,
+        # kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        # kernel_regularizer=reg(),
+        activation='sigmoid',
     )(y)
-    y = keras.layers.BatchNormalization(momentum=0.8)(y)
-    y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    y = keras.layers.Dropout(0.25)(y)
-    y = keras.layers.Conv2D(
-        256, kernel_size=3, strides=2, padding='same'
-    )(y)
-    y = keras.layers.BatchNormalization(momentum=0.8)(y)
-    y = keras.layers.LeakyReLU(alpha=0.2)(y)
-    y = keras.layers.Dropout(0.25)(y)
-    y = keras.layers.Flatten()(y)
-    y = keras.layers.Dense(1, activation='sigmoid')(y)
-
-    return keras.Model(img, y, name='discriminator')
-
-def get_mnist(data_dir=_DATADIR, batch_size=64):
-    """Data preprocessing pipeline"""
-    def norm_and_remove(img, label):
-        """Normalization
-
-        Args:
-            img (tf.Tensor): mnist image tensor
-            label (tf.float32): mnist image label
-        """
-        del label
-        return (tf.cast(img, tf.float32) - 127.5) / 127.5
-        # return tf.cast(img, tf.float32) / 255.0
-
-    (ds_train, ds_test), ds_info = tfds.load(
-        'mnist',
-        split=['train', 'test'],
-        shuffle_files=True,
-        with_info=True,
-        as_supervised=True,
-        data_dir=data_dir,
-        try_gcs=False,
-    )
-
-    ds_train = ds_train.map(
-        norm_and_remove,
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
-    ds_train = ds_train.cache()
-    ds_train = ds_train.shuffle(ds_info.splits['train'].num_examples)
-    ds_train = ds_train.batch(batch_size)
-    ds_train = ds_train.prefetch(tf.data.AUTOTUNE)
-
-    ds_test = ds_test.map(
-        norm_and_remove,
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
-    ds_test = ds_test.cache()
-    ds_test = ds_test.batch(batch_size)
-    ds_test = ds_test.prefetch(tf.data.AUTOTUNE)
-
-    return (ds_train, ds_test)
+    return keras.Model(x, y, name='discriminator')
 
 class SaveImage(keras.callbacks.Callback):
     """Save image: callback function.
@@ -386,8 +322,7 @@ class SaveImage(keras.callbacks.Callback):
                     ] = ndarray[k]
                     k += 1
 
-            # image = 255.0 * grid
-            image = 255.0 * (grid + 1.) / 2.
+            image = 255 * (grid + 1) / 2
             image = np.clip(image, 0, 255)
             image = image.astype('uint8')
 
@@ -428,16 +363,59 @@ class Monitor(keras.metrics.Metric):
     def reset_state(self):
         self.lr.assign(0.0)
 
-def model_build(argv):
-    del argv
-    model = build_discriminator((28, 28, 1))
-    model.summary()
 
-    model = build_generator(51)
-    model.summary()
+def get_mnist(data_dir=_DATADIR, batch_size=128):
+    def norm_and_remove(img, label):
+        """Normalize and Remove label
+
+        Args:
+            img (tf.Tensor): mnist image tensor
+            label (tf.float32): mnist image label
+        """
+        del label
+        return (tf.cast(img, tf.float32) - 127.5) / 127.5
+        # return tf.cast(img, tf.float32) / 255.0
+
+    (ds_train, ds_test), ds_info = tfds.load(
+        'mnist',
+        split=['train', 'test'],
+        shuffle_files=True,
+        with_info=True,
+        as_supervised=True,
+        data_dir=data_dir,
+        try_gcs=False,
+    )
+
+    ds_train = ds_train.map(
+        norm_and_remove,
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    ds_train = ds_train.cache()
+    ds_train = ds_train.shuffle(ds_info.splits['train'].num_examples)
+    ds_train = ds_train.batch(batch_size)
+    ds_train = ds_train.prefetch(tf.data.AUTOTUNE)
+
+    ds_test = ds_test.map(
+        norm_and_remove,
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    ds_test = ds_test.cache()
+    ds_test = ds_test.batch(batch_size)
+    ds_test = ds_test.prefetch(tf.data.AUTOTUNE)
+
+    return (ds_train, ds_test)
+
+def test(argv):
+    del argv
+
+    model = GAN()
+
+    model.generator.summary()
+    model.discriminator.summary()
 
 @main
 def run(argv):
+    """Train GAN on MNIST."""
     del argv
 
     # Environment variable setting
@@ -447,12 +425,12 @@ def run(argv):
 
     logging.set_verbosity(logging.DEBUG)
 
-    model = DCGAN()
+    model = GAN()
 
     ds_train, _ = get_mnist(batch_size=model.batch_size)
 
     model.compile(
-        run_eagerly=FLAGS.run_eagerly,
+        run_eagerly=False,
     )
 
     model.fit(
@@ -460,3 +438,4 @@ def run(argv):
         epochs=model.epochs,
         callbacks=model.callbacks,
     )
+

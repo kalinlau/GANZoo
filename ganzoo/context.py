@@ -1,6 +1,5 @@
 """The CONTEXT module contains inner aux functions."""
 import os
-import sys
 import inspect
 from absl import app
 

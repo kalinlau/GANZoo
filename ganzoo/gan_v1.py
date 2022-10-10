@@ -12,10 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# pylint: disable=ungrouped-imports
 
-"""Vanilla GANs."""
+"""Vanilla GANs. Trained by softplus without artifactual labels."""
 
 import os
 import math
@@ -28,12 +26,6 @@ from PIL import Image
 import tensorflow as tf
 from tensorflow import keras
 import tensorflow_datasets as tfds
-from tensorflow.keras import Model
-from tensorflow.keras.layers import (Input, Concatenate, Dense, LeakyReLU, Conv2DTranspose, Conv2D)
-from tensorflow.keras.layers import ReLU, BatchNormalization, Reshape, Flatten
-from tensorflow.keras.regularizers import L1L2
-from tensorflow.keras.initializers import RandomNormal
-from tensorflow.keras.optimizers import Adam
 
 
 try:
@@ -44,10 +36,10 @@ except ImportError:
     from context import _DATADIR, _WORKDIR, main
 
 
-class GAN(Model):
-    """TODO:
+class GAN(keras.Model):
+    """Vanilla GANs. (https://arxiv.org/abs/1406.2661)
     """
-    def __init__(self, name='gan', **kwargs):
+    def __init__(self, name='gan_v1', **kwargs):
         super().__init__(name=name, **kwargs)
         # Image size
         self.h, self.w, self.c = 28, 28, 1
@@ -96,13 +88,15 @@ class GAN(Model):
             keras.callbacks.TensorBoard(log_dir=self.logdir),
         ]
 
+        # Optimizers
+        self.d_optimizer = keras.optimizers.Adam(
+            learning_rate=self.lr, beta_1=0.5, beta_2=0.999
+        )
+        self.g_optimizer = keras.optimizers.Adam(
+            learning_rate=self.lr, beta_1=0.5, beta_2=0.999
+        )
+
         # Metric monitor
-        self.d_optimizer = Adam(
-            learning_rate=self.lr, beta_1=0.5, beta_2=0.999
-        )
-        self.g_optimizer = Adam(
-            learning_rate=self.lr, beta_1=0.5, beta_2=0.999
-        )
         self.d_loss_metric = keras.metrics.Mean(name='d_loss')
         self.g_loss_metric = keras.metrics.Mean(name='g_loss')
         self.lr_metric = Monitor(name='d_lr')
@@ -116,20 +110,26 @@ class GAN(Model):
         ]
 
     def train_step(self, data):
-        imgs = data
+        """One step train functions.
 
+        Use softplus without artifactual labels. Also, utilize
+        the trick that 1 - logit == - logit for sigmoid.
+        """
+        imgs = data
         batch_size = tf.shape(imgs)[0]
+
+        # Flatten
         img = tf.reshape(imgs, shape=(batch_size, -1), name='flat_img')
+        # Sample latent vector
         z = tf.random.uniform(
             shape=(batch_size, self.z_dim),
             minval=-1,
             maxval=1.,
             dtype=tf.float32,
         )
-
-        img_ = self.generator(z)
-
+        # Forward pass
         with tf.GradientTape(persistent=True) as tape:
+            img_ = self.generator(z)
             d_ins = tf.concat([img_, img], 0)
             d_outs = self.discriminator(d_ins)
             dg, dx = tf.split(d_outs, num_or_size_splits=2, axis=0)
@@ -137,14 +137,14 @@ class GAN(Model):
             d_loss = tf.reduce_mean(tf.math.softplus(dg)) \
                 + tf.reduce_mean(tf.math.softplus(-dx))
             g_loss = tf.reduce_mean(tf.math.softplus(-dg))
-
-        d_gradients = tf.gradients(
+        # Gradient
+        d_gradients = tape.gradient(
             d_loss, self.discriminator.trainable_variables
         )
-        g_gradients = tf.gradients(
+        g_gradients = tape.gradient(
             g_loss, self.generator.trainable_variables
         )
-
+        # Backward pass
         self.d_optimizer.apply_gradients(
             zip(d_gradients, self.discriminator.trainable_variables)
         )
@@ -152,6 +152,10 @@ class GAN(Model):
             zip(g_gradients, self.generator.trainable_variables)
         )
 
+        # Release tape object.
+        del tape
+
+        # Update metric monitor
         self.d_loss_metric.update_state(d_loss)
         self.g_loss_metric.update_state(g_loss)
         self.lr_metric.update_state(self.d_optimizer.learning_rate)
@@ -164,7 +168,7 @@ class GAN(Model):
 def build_generator(
         img_shape,
         z_dim,
-        reg=lambda: L1L2(l1=0., l2=2.5e-5),
+        reg=lambda: keras.regularizers.L1L2(l1=0., l2=2.5e-5),
     ):
     """Generator Network
 
@@ -172,31 +176,37 @@ def build_generator(
     Regularization: L2(2.5e-5)
     Kernal Initialization: Normal(mean=0., stddev=0.02)
     """
-    x = Input(z_dim)
-    y = Dense(
+    x = keras.layers.Input(z_dim)
+    y = keras.layers.Dense(
         256,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_initializer=keras.initializers.RandomNormal(
+            mean=0.0, stddev=0.02
+        ),
         kernel_regularizer=reg(),
     )(x)
-    y = ReLU()(y)
-    y = Dense(
+    y = keras.layers.ReLU()(y)
+    y = keras.layers.Dense(
         512,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_initializer=keras.initializers.RandomNormal(
+            mean=0.0, stddev=0.02
+        ),
         kernel_regularizer=reg(),
     )(y)
-    y = ReLU()(y)
-    y = BatchNormalization()(y)
-    y = Dense(
+    y = keras.layers.ReLU()(y)
+    y = keras.layers.BatchNormalization()(y)
+    y = keras.layers.Dense(
         img_shape,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_initializer=keras.initializers.RandomNormal(
+            mean=0.0, stddev=0.02
+        ),
         kernel_regularizer=reg(),
     )(y)
-    return Model(x, y, name='generator')
+    return keras.Model(x, y, name='generator')
 
 def build_discriminator(
         img_shape,
         z_dim,
-        reg=lambda: L1L2(l1=0, l2=2e-5),
+        reg=lambda: keras.regularizers.L1L2(l1=0, l2=2e-5),
     ):
     """Discriminator Network
 
@@ -206,26 +216,32 @@ def build_discriminator(
         Normal(mean=0.0, stddev=0.5), Normal(mean=0., stddev=0.02)
     """
     del z_dim
-    x = Input(img_shape)
-    y = Dense(
+    x = keras.layers.Input(img_shape)
+    y = keras.layers.Dense(
         512,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.5),
+        kernel_initializer=keras.initializers.RandomNormal(
+            mean=0.0, stddev=0.5
+        ),
         kernel_regularizer=reg(),
     )(x)
-    y = LeakyReLU(alpha=0.2)(y)
-    y = Dense(
+    y = keras.layers.LeakyReLU(alpha=0.2)(y)
+    y = keras.layers.Dense(
         256,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_initializer=keras.initializers.RandomNormal(
+            mean=0.0, stddev=0.02
+        ),
         kernel_regularizer=reg(),
     )(y)
-    y = LeakyReLU(alpha=0.2)(y)
-    y = BatchNormalization()(y)
-    y = Dense(
+    y = keras.layers.LeakyReLU(alpha=0.2)(y)
+    y = keras.layers.BatchNormalization()(y)
+    y = keras.layers.Dense(
         1,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_initializer=keras.initializers.RandomNormal(
+            mean=0.0, stddev=0.02
+        ),
         kernel_regularizer=reg(),
     )(y)
-    return Model(x, y, name='discriminator')
+    return keras.Model(x, y, name='discriminator')
 
 class SaveImage(keras.callbacks.Callback):
     """Save image: callback function.
