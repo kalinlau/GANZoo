@@ -15,10 +15,11 @@
 #
 # pylint: disable=ungrouped-imports
 
-"""Bidirectional GANs."""
+"""Vanilla GANs."""
 
 import os
 import math
+
 from datetime import datetime
 from absl import logging
 
@@ -28,8 +29,8 @@ import tensorflow as tf
 from tensorflow import keras
 import tensorflow_datasets as tfds
 from tensorflow.keras import Model
-from tensorflow.keras.layers import Input, Concatenate, Dense, LeakyReLU
-from tensorflow.keras.layers import ReLU, BatchNormalization
+from tensorflow.keras.layers import (Input, Concatenate, Dense, LeakyReLU, Conv2DTranspose, Conv2D)
+from tensorflow.keras.layers import ReLU, BatchNormalization, Reshape, Flatten
 from tensorflow.keras.regularizers import L1L2
 from tensorflow.keras.initializers import RandomNormal
 from tensorflow.keras.optimizers import Adam
@@ -42,24 +43,27 @@ except ImportError:
     # Script import
     from context import _DATADIR, _WORKDIR, main
 
-class BiGAN(Model):
-    """Invariant BiGAN.
 
-    (https://arxiv.org/pdf/1605.09782.pdf)
+class GAN(Model):
+    """TODO:
     """
-    def __init__(self, name='bigan', **kwargs):
+    def __init__(self, name='gan', **kwargs):
         super().__init__(name=name, **kwargs)
         # Image size
         self.h, self.w, self.c = 28, 28, 1
-        self.image_shape = self.h * self.w * self.c
+        self.img_shape = self.h * self.w * self.c
+
+        # Training details
+        self.lr = 1e-4
+        self.epochs = 400
+        self.batch_size = 32
+
         # Latent dim
         self.z_dim = 50
-        # Batch size
-        self.batch_size = 128
-        # Epochs
-        self.epochs = 400
-        # Init learning rate
-        self.lr = 1e-4
+
+        # Build models
+        self.generator = build_generator(self.img_shape, self.z_dim)
+        self.discriminator = build_discriminator(self.img_shape, self.z_dim)
 
         # Working directory
         timeshift = datetime.today().strftime('%Y%m%d-%H:%M:%S')
@@ -72,76 +76,67 @@ class BiGAN(Model):
         tf.io.gfile.makedirs(self.logdir)
         tf.io.gfile.makedirs(self.imgdir)
 
-        self.generator = build_generator(
-            self.image_shape, self.z_dim
-        )
-        self.encoder = build_encoder(
-            self.image_shape, self.z_dim
-        )
-        self.discriminator = build_discriminator(
-            self.image_shape, self.z_dim
-        )
-
+        # Save model architecture, not weights.
+        # MNIST is a small dataset to reproduce.
         gjson = self.generator.to_json()
-        ejson = self.encoder.to_json()
         djson = self.discriminator.to_json()
 
         with open(
             os.path.join(self.workdir, 'model.json'),
             mode='w',
-            encoding='utf-8'
+            encoding='utf-8',
         ) as json_file:
             json_file.write(gjson)
-            json_file.write(ejson)
             json_file.write(djson)
 
+        # Keras Callbacks.
         self.callbacks = [
             SaveImage(workdir=self.imgdir, latent_dim=self.z_dim),
             LearningRateDecay(init_lr=self.lr, decay_steps=self.epochs / 2.0),
             keras.callbacks.TensorBoard(log_dir=self.logdir),
         ]
+
+        # Metric monitor
         self.d_optimizer = Adam(
             learning_rate=self.lr, beta_1=0.5, beta_2=0.999
         )
         self.g_optimizer = Adam(
             learning_rate=self.lr, beta_1=0.5, beta_2=0.999
         )
-        self.e_optimizer = Adam(
-            learning_rate=self.lr, beta_1=0.5, beta_2=0.999
-        )
         self.d_loss_metric = keras.metrics.Mean(name='d_loss')
         self.g_loss_metric = keras.metrics.Mean(name='g_loss')
         self.lr_metric = Monitor(name='d_lr')
 
+
     @property
     def metrics(self):
-        return [self.d_loss_metric, self.g_loss_metric, self.lr_metric]
+        return [
+            self.d_loss_metric,
+            self.lr_metric,
+        ]
 
     def train_step(self, data):
-        image = data
-        batch_size = tf.shape(image)[0]
-        img = tf.reshape(image, shape=(batch_size, -1), name='flatten_img')
+        imgs = data
+
+        batch_size = tf.shape(imgs)[0]
+        img = tf.reshape(imgs, shape=(batch_size, -1), name='flat_img')
         z = tf.random.uniform(
             shape=(batch_size, self.z_dim),
             minval=-1,
             maxval=1.,
-            dtype=tf.float32
+            dtype=tf.float32,
         )
 
         img_ = self.generator(z)
-        z_ = self.encoder(img)
 
-        d_inputs = [
-            tf.concat([img_, img], 0),
-            tf.concat([z, z_], 0),
-        ]
-        d_preds = self.discriminator(d_inputs)
-        pred_g, pred_e = tf.split(d_preds,num_or_size_splits=2, axis=0)
+        with tf.GradientTape(persistent=True) as tape:
+            d_ins = tf.concat([img_, img], 0)
+            d_outs = self.discriminator(d_ins)
+            dg, dx = tf.split(d_outs, num_or_size_splits=2, axis=0)
 
-        d_loss = tf.reduce_mean(tf.math.softplus(pred_g)) + \
-            tf.reduce_mean(tf.math.softplus(-pred_e))
-        g_loss = tf.reduce_mean(tf.math.softplus(-pred_g))
-        e_loss = tf.reduce_mean(tf.math.softplus(pred_e))
+            d_loss = tf.reduce_mean(tf.math.softplus(dg)) \
+                + tf.reduce_mean(tf.math.softplus(-dx))
+            g_loss = tf.reduce_mean(tf.math.softplus(-dg))
 
         d_gradients = tf.gradients(
             d_loss, self.discriminator.trainable_variables
@@ -149,18 +144,12 @@ class BiGAN(Model):
         g_gradients = tf.gradients(
             g_loss, self.generator.trainable_variables
         )
-        e_gradients = tf.gradients(
-            e_loss, self.encoder.trainable_variables
-        )
 
         self.d_optimizer.apply_gradients(
             zip(d_gradients, self.discriminator.trainable_variables)
         )
         self.g_optimizer.apply_gradients(
             zip(g_gradients, self.generator.trainable_variables)
-        )
-        self.e_optimizer.apply_gradients(
-            zip(e_gradients, self.encoder.trainable_variables)
         )
 
         self.d_loss_metric.update_state(d_loss)
@@ -171,6 +160,72 @@ class BiGAN(Model):
                 'g_loss': self.g_loss_metric.result(),
                 'd_lr':self.lr_metric.result(),}
 
+
+def build_generator(
+        img_shape,
+        z_dim,
+        reg=lambda: L1L2(l1=0., l2=2.5e-5),
+    ):
+    """Generator Network
+
+    Architecture: (1024)FC_ReLU-(1024)FC_ReLU_BN-(784)FC
+    Regularization: L2(2.5e-5)
+    Kernal Initialization: Normal(mean=0., stddev=0.02)
+    """
+    x = Input(z_dim)
+    y = Dense(
+        256,
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_regularizer=reg(),
+    )(x)
+    y = ReLU()(y)
+    y = Dense(
+        512,
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_regularizer=reg(),
+    )(y)
+    y = ReLU()(y)
+    y = BatchNormalization()(y)
+    y = Dense(
+        img_shape,
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_regularizer=reg(),
+    )(y)
+    return Model(x, y, name='generator')
+
+def build_discriminator(
+        img_shape,
+        z_dim,
+        reg=lambda: L1L2(l1=0, l2=2e-5),
+    ):
+    """Discriminator Network
+
+    Architecture: (1024)FC_lrelu-(1024)FC_lrelu_BN-(z_dim)FC
+    Regularization: L2(2.5e-5)
+    Kernal Initialization:
+        Normal(mean=0.0, stddev=0.5), Normal(mean=0., stddev=0.02)
+    """
+    del z_dim
+    x = Input(img_shape)
+    y = Dense(
+        512,
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.5),
+        kernel_regularizer=reg(),
+    )(x)
+    y = LeakyReLU(alpha=0.2)(y)
+    y = Dense(
+        256,
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_regularizer=reg(),
+    )(y)
+    y = LeakyReLU(alpha=0.2)(y)
+    y = BatchNormalization()(y)
+    y = Dense(
+        1,
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_regularizer=reg(),
+    )(y)
+    return Model(x, y, name='discriminator')
 
 class SaveImage(keras.callbacks.Callback):
     """Save image: callback function.
@@ -238,7 +293,6 @@ class SaveImage(keras.callbacks.Callback):
                 os.path.join(self.workdir, f'G_z-{epoch + 1}.png')
             )
 
-
 class LearningRateDecay(keras.callbacks.Callback):
     """Rate decay schedule: exponential decay.
     """
@@ -250,12 +304,10 @@ class LearningRateDecay(keras.callbacks.Callback):
     def on_epoch_begin(self, epoch, logs=None): # pylint: disable=unused-argument
         d_lr = self.model.d_optimizer.learning_rate
         g_lr = self.model.g_optimizer.learning_rate
-        e_lr = self.model.e_optimizer.learning_rate
         if epoch >= self.bound:
             weight = self.decay_rate ** (epoch / self.bound)
             d_lr.assign(self.lr * weight)
             g_lr.assign(self.lr * weight)
-            e_lr.assign(self.lr * weight)
 
 class Monitor(keras.metrics.Metric):
     """Learning rate monitor.
@@ -273,110 +325,10 @@ class Monitor(keras.metrics.Metric):
     def reset_state(self):
         self.lr.assign(0.0)
 
-def build_generator(
-        img_shape,
-        z_dim,
-        reg=lambda: L1L2(l1=0., l2=2.5e-5),
-    ):
-    """Generator Network
-
-    Architecture: (1024)FC_ReLU-(1024)FC_ReLU_BN-(784)FC
-    Regularization: L2(2.5e-5)
-    Kernal Initialization: Normal(mean=0., stddev=0.02)
-    """
-    x = Input(z_dim)
-    y = Dense(
-        1024,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
-        kernel_regularizer=reg(),
-    )(x)
-    y = ReLU()(y)
-    y = Dense(
-        1024,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
-        kernel_regularizer=reg(),
-    )(y)
-    y = ReLU()(y)
-    y = BatchNormalization()(y)
-    y = Dense(
-        img_shape,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
-        kernel_regularizer=reg(),
-    )(y)
-    return Model(x, y, name='generator')
-
-def build_encoder(
-        img_shape,
-        z_dim,
-        reg=lambda: L1L2(l1=0., l2=2.5e-5),
-    ):
-    """Encoder Network
-
-    Architecture: (1024)FC_lrelu-(1024)FC_lrelu_BN-(z_dim)FC
-    Regularization: L2(2.5e-5)
-    Kernal Initialization: Normal(mean=0., stddev=0.02)
-    """
-    # ----- Original Arch -----
-    x = Input(img_shape)
-    y = Dense(
-        1024,
-        kernel_regularizer=reg(),
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02)
-    )(x)
-    y = LeakyReLU(alpha=0.2)(y)
-    y = Dense(
-        1024,
-        kernel_regularizer=reg(),
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02)
-    )(y)
-    y = LeakyReLU(alpha=0.2)(y)
-    y = BatchNormalization()(y)
-    y = Dense(
-        z_dim,
-        kernel_regularizer=reg(),
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02)
-    )(y)
-
-    return Model(x, y, name='encoder')
-
-def build_discriminator(
-        img_shape,
-        z_dim,
-        reg=lambda: L1L2(l1=0, l2=2e-5),
-    ):
-    """Discriminator Network
-
-    Architecture: (1024)FC_lrelu-(1024)FC_lrelu_BN-(z_dim)FC
-    Regularization: L2(2.5e-5)
-    Kernal Initialization:
-        Normal(mean=0.0, stddev=0.5), Normal(mean=0., stddev=0.02)
-    """
-    x = Input(img_shape)
-    z = Input(z_dim)
-    y = Concatenate()([x,z])
-    y = Dense(
-        1024,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.5),
-        kernel_regularizer=reg(),
-    )(y)
-    y = LeakyReLU(alpha=0.2)(y)
-    y = Dense(
-        1024,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
-        kernel_regularizer=reg(),
-    )(y)
-    y = LeakyReLU(alpha=0.2)(y)
-    y = BatchNormalization()(y)
-    y = Dense(
-        1,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
-        kernel_regularizer=reg(),
-    )(y)
-    return Model([x, z], [y], name='discriminator')
 
 def get_mnist(data_dir=_DATADIR, batch_size=128):
     def norm_and_remove(img, label):
-        """Normalize to [-1, 1] and Remove label
+        """Normalize to [0, 1] and Remove label
 
         Args:
             img (tf.Tensor): mnist image tensor
@@ -387,6 +339,7 @@ def get_mnist(data_dir=_DATADIR, batch_size=128):
         """
         del label
         return (tf.cast(img, tf.float32) - 127.5) / 127.5
+        # return tf.cast(img, tf.float32) / 255.0
 
     (ds_train, ds_test), ds_info = tfds.load(
         'mnist',
@@ -417,9 +370,19 @@ def get_mnist(data_dir=_DATADIR, batch_size=128):
 
     return (ds_train, ds_test)
 
+
+def test(argv):
+    del argv
+
+    model = GAN()
+
+    model.generator.summary()
+    model.discriminator.summary()
+
+
 @main
 def run(argv):
-    """Train BiGAN on MNIST."""
+    """Train GAN on MNIST."""
     del argv
 
     # Environment variable setting
@@ -429,16 +392,17 @@ def run(argv):
 
     logging.set_verbosity(logging.DEBUG)
 
-    model = BiGAN()
+    model = GAN()
 
-    x_train, _ = get_mnist(
-        batch_size=model.batch_size
+    ds_train, _ = get_mnist(batch_size=model.batch_size)
+
+    model.compile(
+        run_eagerly=False,
     )
 
-    model.compile()
-
     model.fit(
-        x_train,
+        ds_train,
         epochs=model.epochs,
         callbacks=model.callbacks,
     )
+
