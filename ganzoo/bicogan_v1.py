@@ -15,10 +15,11 @@
 #
 # pylint: disable=ungrouped-imports
 
-"""Bidirectional GANs."""
+"""Bidirectional Conditional GANs."""
 
 import os
 import math
+
 from datetime import datetime
 from absl import logging
 
@@ -33,6 +34,7 @@ from tensorflow.keras.layers import ReLU, BatchNormalization
 from tensorflow.keras.regularizers import L1L2
 from tensorflow.keras.initializers import RandomNormal
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import BinaryCrossentropy
 
 
 try:
@@ -42,24 +44,38 @@ except ImportError:
     # Script import
     from context import _DATADIR, _WORKDIR, main
 
-class BiGAN(Model):
-    """Invariant BiGAN.
 
-    (https://arxiv.org/pdf/1605.09782.pdf)
+class BiCoGAN(Model):
+    """Invariant BiCoGAN (https://arxiv.org/pdf/1711.07461v1.pdf)
     """
-    def __init__(self, name='bigan', **kwargs):
+    def __init__(self, name='bicogan', **kwargs):
         super().__init__(name=name, **kwargs)
         # Image size
         self.h, self.w, self.c = 28, 28, 1
-        self.image_shape = self.h * self.w * self.c
+        self.img_shape = self.h * self.w * self.c
+        self.n_dim = 10
+
+        # Training details
+        self.lr = 1e-4
+        self.epochs = 400
+        self.batch_size = 128
+
         # Latent dim
         self.z_dim = 50
-        # Batch size
-        self.batch_size = 128
-        # Epochs
-        self.epochs = 400
-        # Init learning rate
-        self.lr = 1e-4
+
+        # EFL weight
+        self.gamma = 5
+
+        # Build models
+        self.encoder = build_encoder(
+            self.img_shape, self.n_dim, self.z_dim
+        )
+        self.generator = build_generator(
+            self.img_shape, self.n_dim, self.z_dim
+        )
+        self.discriminator = build_discriminator(
+            self.img_shape, self.n_dim, self.z_dim
+        )
 
         # Working directory
         timeshift = datetime.today().strftime('%Y%m%d-%H:%M:%S')
@@ -72,16 +88,8 @@ class BiGAN(Model):
         tf.io.gfile.makedirs(self.logdir)
         tf.io.gfile.makedirs(self.imgdir)
 
-        self.generator = build_generator(
-            self.image_shape, self.z_dim
-        )
-        self.encoder = build_encoder(
-            self.image_shape, self.z_dim
-        )
-        self.discriminator = build_discriminator(
-            self.image_shape, self.z_dim
-        )
-
+        # Save model architecture, not weights.
+        # MNIST is a small dataset to reproduce.
         gjson = self.generator.to_json()
         ejson = self.encoder.to_json()
         djson = self.discriminator.to_json()
@@ -89,17 +97,20 @@ class BiGAN(Model):
         with open(
             os.path.join(self.workdir, 'model.json'),
             mode='w',
-            encoding='utf-8'
+            encoding='utf-8',
         ) as json_file:
             json_file.write(gjson)
             json_file.write(ejson)
             json_file.write(djson)
 
+        # Keras Callbacks.
         self.callbacks = [
             SaveImage(workdir=self.imgdir, latent_dim=self.z_dim),
             LearningRateDecay(init_lr=self.lr, decay_steps=self.epochs / 2.0),
             keras.callbacks.TensorBoard(log_dir=self.logdir),
         ]
+
+        # Optimizer
         self.d_optimizer = Adam(
             learning_rate=self.lr, beta_1=0.5, beta_2=0.999
         )
@@ -109,50 +120,77 @@ class BiGAN(Model):
         self.e_optimizer = Adam(
             learning_rate=self.lr, beta_1=0.5, beta_2=0.999
         )
+
+        # External factor loss: BCE
+        self.efl = BinaryCrossentropy(from_logits=True, name='EFL')
+
+        # Metric monitor
         self.d_loss_metric = keras.metrics.Mean(name='d_loss')
-        self.g_loss_metric = keras.metrics.Mean(name='g_loss')
-        self.lr_metric = Monitor(name='d_lr')
+        self.e_loss_metric = keras.metrics.Mean(name='e_loss')
+        self.lr_metric = Monitor(name='lr')
 
     @property
     def metrics(self):
-        return [self.d_loss_metric, self.g_loss_metric, self.lr_metric]
+        return [
+            self.d_loss_metric,
+            self.e_loss_metric,
+            self.lr_metric
+        ]
 
     def train_step(self, data):
-        image = data
-        batch_size = tf.shape(image)[0]
-        img = tf.reshape(image, shape=(batch_size, -1), name='flatten_img')
+        """One step forward / backward computation.
+        """
+        # Unpack data
+        img, c = data
+        batch_size = tf.shape(img)[0]
+
+        img = tf.reshape(
+            img,
+            shape=(batch_size, -1),
+            name='flatimg',
+        )
         z = tf.random.uniform(
             shape=(batch_size, self.z_dim),
             minval=-1,
-            maxval=1.,
+            maxval=1,
             dtype=tf.float32
         )
 
-        img_ = self.generator(z)
-        z_ = self.encoder(img)
+        with tf.GradientTape(persistent=True) as tape:
+            # Forward pass: Encoder and Generator
+            z_, c_ = self.encoder(img)
+            img_ = self.generator([z, c])
+            # Forward pass: Discriminator
+            d_inputs = [
+                tf.concat([img_, img], 0),
+                tf.concat([z, z_], 0),
+                tf.concat([c, c_], 0),
+            ]
+            d_outs = self.discriminator(d_inputs)
+            pred_g, pred_e = tf.split(d_outs, num_or_size_splits=2, axis=0)
 
-        d_inputs = [
-            tf.concat([img_, img], 0),
-            tf.concat([z, z_], 0),
-        ]
-        d_preds = self.discriminator(d_inputs)
-        pred_g, pred_e = tf.split(d_preds,num_or_size_splits=2, axis=0)
+            # Loss function
+            d_loss = tf.reduce_mean(tf.math.softplus(pred_g)) + \
+                tf.reduce_mean(tf.math.softplus(-pred_e))
+            g_loss = tf.reduce_mean(tf.math.softplus(-pred_g))
+            e_loss = tf.reduce_mean(tf.math.softplus(pred_e)) + \
+                self.gamma * self.efl(c_, c)
 
-        d_loss = tf.reduce_mean(tf.math.softplus(pred_g)) + \
-            tf.reduce_mean(tf.math.softplus(-pred_e))
-        g_loss = tf.reduce_mean(tf.math.softplus(-pred_g))
-        e_loss = tf.reduce_mean(tf.math.softplus(pred_e))
-
-        d_gradients = tf.gradients(
-            d_loss, self.discriminator.trainable_variables
+        # Gradient computation
+        d_gradients = tape.gradient(
+            d_loss, self.discriminator.trainable_variables,
         )
-        g_gradients = tf.gradients(
-            g_loss, self.generator.trainable_variables
+        g_gradients = tape.gradient(
+            g_loss, self.generator.trainable_variables,
         )
-        e_gradients = tf.gradients(
-            e_loss, self.encoder.trainable_variables
+        e_gradients = tape.gradient(
+            e_loss, self.encoder.trainable_variables,
         )
 
+        # Release tape object
+        del tape
+
+        # Optimizer update
         self.d_optimizer.apply_gradients(
             zip(d_gradients, self.discriminator.trainable_variables)
         )
@@ -163,14 +201,16 @@ class BiGAN(Model):
             zip(e_gradients, self.encoder.trainable_variables)
         )
 
+        # Metric update
         self.d_loss_metric.update_state(d_loss)
-        self.g_loss_metric.update_state(g_loss)
+        self.e_loss_metric.update_state(g_loss)
         self.lr_metric.update_state(self.d_optimizer.learning_rate)
 
-        return {'d_loss': self.d_loss_metric.result(),
-                'g_loss': self.g_loss_metric.result(),
-                'd_lr':self.lr_metric.result(),}
-
+        return {
+            'd_loss': self.d_loss_metric.result(),
+            'e_loss': self.e_loss_metric.result(),
+            'lr': self.lr_metric.result(),
+        }
 
 class SaveImage(keras.callbacks.Callback):
     """Save image: callback function.
@@ -191,10 +231,19 @@ class SaveImage(keras.callbacks.Callback):
                 minval=-1.,
                 maxval=1.
             )
+            # Label vector
+            labels = tf.range(0, 10, dtype=tf.int32)
+            labels = tf.reshape(labels, shape=(1, -1))
+            labels = tf.tile(labels, [1, 10])
+            c = tf.one_hot(labels, depth=10)[0]
 
             # Image generation
-            image = self.model.generator.predict(z)
+            image = self.model.generator.predict([z, c])
 
+            # Save in png format
+            # image = np.reshape(image, (10, 10, 28, 28))
+            # image = np.transpose(image, (0, 2, 1, 3))
+            # image = np.reshape(image, (10 * 28, 10 * 28))
             nrow = 10
             padding = 2
             pad_value = 0.3
@@ -238,7 +287,6 @@ class SaveImage(keras.callbacks.Callback):
                 os.path.join(self.workdir, f'G_z-{epoch + 1}.png')
             )
 
-
 class LearningRateDecay(keras.callbacks.Callback):
     """Rate decay schedule: exponential decay.
     """
@@ -273,51 +321,21 @@ class Monitor(keras.metrics.Metric):
     def reset_state(self):
         self.lr.assign(0.0)
 
-def build_generator(
-        img_shape,
-        z_dim,
-        reg=lambda: L1L2(l1=0., l2=2.5e-5),
-    ):
-    """Generator Network
-
-    Architecture: (1024)FC_ReLU-(1024)FC_ReLU_BN-(784)FC
-    Regularization: L2(2.5e-5)
-    Kernal Initialization: Normal(mean=0., stddev=0.02)
-    """
-    x = Input(z_dim)
-    y = Dense(
-        1024,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
-        kernel_regularizer=reg(),
-    )(x)
-    y = ReLU()(y)
-    y = Dense(
-        1024,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
-        kernel_regularizer=reg(),
-    )(y)
-    y = ReLU()(y)
-    y = BatchNormalization()(y)
-    y = Dense(
-        img_shape,
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
-        kernel_regularizer=reg(),
-    )(y)
-    return Model(x, y, name='generator')
-
 def build_encoder(
-        img_shape,
-        z_dim,
-        reg=lambda: L1L2(l1=0., l2=2.5e-5),
-    ):
-    """Encoder Network
+    img_shape,
+    n_dim,
+    z_dim,
+    reg = lambda: L1L2(l1=0., l2=2.5e-5),
+):
+    """Encoder: z, c = E(x; theta_E)
 
-    Architecture: (1024)FC_lrelu-(1024)FC_lrelu_BN-(z_dim)FC
-    Regularization: L2(2.5e-5)
-    Kernal Initialization: Normal(mean=0., stddev=0.02)
+    Inverse mapping x (image) back to both intrinsic factor z (latent vector)
+    and extrinsic factor c (label)
+
+    WARNING: API is not same as mentioned in paper,  output two factors instead
+    of a concatenated one.
     """
-    # ----- Original Arch -----
-    x = Input(img_shape)
+    x = Input(shape=(img_shape), name='image')
     y = Dense(
         1024,
         kernel_regularizer=reg(),
@@ -331,29 +349,77 @@ def build_encoder(
     )(y)
     y = LeakyReLU(alpha=0.2)(y)
     y = BatchNormalization()(y)
-    y = Dense(
+
+    z = Dense(
         z_dim,
         kernel_regularizer=reg(),
-        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02)
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        name='out_z',
+    )(y)
+    c = Dense(
+        n_dim,
+        kernel_regularizer=reg(),
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        name='out_c',
     )(y)
 
-    return Model(x, y, name='encoder')
+    return Model(x, [z, c], name='encoder')
+
+def build_generator(
+    img_shape,
+    n_dim,
+    z_dim,
+    reg = lambda: L1L2(l1=0., l2=2.5e-5)
+):
+    """Generator: x = G([z c]; theta_G)
+
+    Generate Image x by intrinsic factor z (latent vector) and
+    extrinsic factor c (label)
+    """
+    z = Input(shape=(z_dim), name='intrinsic_z')
+    c = Input(shape=(n_dim), name='extrinsic_c')
+    h = Concatenate(axis=-1)([z, c])
+    y = Dense(
+        1024,
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_regularizer=reg(),
+    )(h)
+    y = ReLU()(y)
+    y = Dense(
+        1024,
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_regularizer=reg(),
+    )(y)
+    y = ReLU()(y)
+    y = BatchNormalization()(y)
+    x = Dense(
+        img_shape,
+        kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
+        kernel_regularizer=reg(),
+        name='out',
+    )(y)
+    return Model([z, c], x, name='generator')
+
 
 def build_discriminator(
-        img_shape,
-        z_dim,
-        reg=lambda: L1L2(l1=0, l2=2e-5),
-    ):
-    """Discriminator Network
+    img_shape,
+    n_dim,
+    z_dim,
+    reg = lambda: L1L2(l1=0., l2=2.5e-5),
+):
+    """Discriminator: D(x, z, c; theta_D)
 
-    Architecture: (1024)FC_lrelu-(1024)FC_lrelu_BN-(z_dim)FC
-    Regularization: L2(2.5e-5)
-    Kernal Initialization:
-        Normal(mean=0.0, stddev=0.5), Normal(mean=0., stddev=0.02)
+    Predict whether image x and latent vector is real or fake.
+    No `sigmoid` activation at output layer
+
+    fake: D(G(z_hat), z_hat; theta_D), z_hat = [z c]
+    Real: D(x, E(x); theta_D)
     """
-    x = Input(img_shape)
-    z = Input(z_dim)
-    y = Concatenate()([x,z])
+    x = Input(shape=(img_shape,), name='image')
+    z = Input(shape=(z_dim,), name='intrinsic_z')
+    c = Input(shape=(n_dim,), name='extrinsic_c')
+    y = Concatenate(axis=-1)([x, z, c])
+
     y = Dense(
         1024,
         kernel_initializer=RandomNormal(mean=0.0, stddev=0.5),
@@ -371,8 +437,10 @@ def build_discriminator(
         1,
         kernel_initializer=RandomNormal(mean=0.0, stddev=0.02),
         kernel_regularizer=reg(),
+        name='out',
     )(y)
-    return Model([x, z], [y], name='discriminator')
+    return Model([x, z, c], [y], name='discriminator')
+
 
 def get_mnist(data_dir=_DATADIR, batch_size=128):
     def norm_and_remove(img, label):
@@ -385,8 +453,10 @@ def get_mnist(data_dir=_DATADIR, batch_size=128):
         Returns:
             img: normalized image
         """
-        del label
-        return (tf.cast(img, tf.float32) - 127.5) / 127.5
+        return (
+            (tf.cast(img, tf.float32) - 127.5) / 127.5,
+            tf.one_hot(label, depth=10),
+        )
 
     (ds_train, ds_test), ds_info = tfds.load(
         'mnist',
@@ -417,9 +487,29 @@ def get_mnist(data_dir=_DATADIR, batch_size=128):
 
     return (ds_train, ds_test)
 
+def test1(argv):
+    """DEBUG: Network Summary."""
+    del argv
+    h, w, c = 28, 28, 1
+    img_shape = h * w * c
+    n_dim = 10
+    z_dim = 50
+
+    encoder = build_encoder(img_shape, n_dim, z_dim)
+    encoder.summary()
+
+    generator = build_generator(img_shape, n_dim, z_dim)
+    generator.summary()
+
+    discriminator = build_discriminator(img_shape, n_dim, z_dim)
+    discriminator.summary()
+
+
+    logging.debug(discriminator.get_layer('out').output.shape)
+
 @main
 def run(argv):
-    """Train BiGAN on MNIST."""
+    """Train BiCoGAN on MNIST."""
     del argv
 
     # Environment variable setting
@@ -429,16 +519,16 @@ def run(argv):
 
     logging.set_verbosity(logging.DEBUG)
 
-    model = BiGAN()
+    bicogan = BiCoGAN()
 
-    x_train, _ = get_mnist(
-        batch_size=model.batch_size
+    ds_train, _ = get_mnist(batch_size=bicogan.batch_size)
+
+    bicogan.compile(
+        run_eagerly=False,
     )
 
-    model.compile()
-
-    model.fit(
-        x_train,
-        epochs=model.epochs,
-        callbacks=model.callbacks,
+    bicogan.fit(
+        ds_train,
+        epochs=bicogan.epochs,
+        callbacks=bicogan.callbacks,
     )
