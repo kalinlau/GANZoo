@@ -48,7 +48,7 @@ except ImportError:
 class BiCoGAN(Model):
     """Invariant BiCoGAN (https://arxiv.org/pdf/1711.07461v1.pdf)
     """
-    def __init__(self, name='bicogan', **kwargs):
+    def __init__(self, name='bicogan_v1', **kwargs):
         super().__init__(name=name, **kwargs)
         # Image size
         self.h, self.w, self.c = 28, 28, 1

@@ -13,19 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# pylint: disable=ungrouped-imports
 
-"""Conditional GAN"""
+"""Bidirectional Conditional GANs."""
 
 import os
 import math
+
 from datetime import datetime
 from absl import logging, flags
+
 import numpy as np
 from PIL import Image
 import tensorflow as tf
 from tensorflow import keras
 import tensorflow_datasets as tfds
-
 
 try:
     # Module import
@@ -42,8 +44,9 @@ flags.DEFINE_boolean(
 )
 
 
-class CGAN(keras.Model):
-    def __init__(self, name='cgan', **kwargs):
+class BiCoGAN(keras.Model):
+    """BiCoGAN trained by BCE"""
+    def __init__(self, name='bicogan_v2', **kwargs):
         super().__init__(name=name, **kwargs)
         # Image size
         self.h, self.w, self.c = 28, 28, 1
@@ -58,12 +61,19 @@ class CGAN(keras.Model):
         # Latent dim
         self.z_dim = 50
 
+        # EFL weight
+        # TODO: 5 will not work, 4 or 3
+        self.gamma = 4
+
         # Build models
+        self.encoder = build_encoder(
+            self.img_shape, self.n_dim, self.z_dim
+        )
         self.generator = build_generator(
-            self.img_shape, self.n_dim, self.z_dim,
+            self.img_shape, self.n_dim, self.z_dim
         )
         self.discriminator = build_discriminator(
-            self.img_shape, self.n_dim,
+            self.img_shape, self.n_dim, self.z_dim
         )
 
         # Working directory
@@ -80,6 +90,7 @@ class CGAN(keras.Model):
         # Save model architecture, not weights.
         # MNIST is a small dataset to reproduce.
         gjson = self.generator.to_json()
+        ejson = self.encoder.to_json()
         djson = self.discriminator.to_json()
 
         with open(
@@ -88,6 +99,7 @@ class CGAN(keras.Model):
             encoding='utf-8',
         ) as json_file:
             json_file.write(gjson)
+            json_file.write(ejson)
             json_file.write(djson)
 
         # Keras Callbacks.
@@ -104,22 +116,41 @@ class CGAN(keras.Model):
         self.g_optimizer = keras.optimizers.Adam(
             learning_rate=self.lr, beta_1=0.5, beta_2=0.999
         )
+        self.e_optimizer = keras.optimizers.Adam(
+            learning_rate=self.lr, beta_1=0.5, beta_2=0.999
+        )
 
         # Loss
-        self.loss_fn = keras.losses.BinaryCrossentropy(from_logits=False)
+        self.efl = keras.losses.BinaryCrossentropy(
+            from_logits=True, name='EFL',
+        )
+        self.loss_fn = keras.losses.BinaryCrossentropy(
+            from_logits=False, name='saturated_loss',
+        )
 
         # Metric monitor
         self.d_loss_metric = keras.metrics.Mean(name='d_loss')
+        self.e_loss_metric = keras.metrics.Mean(name='e_loss')
         self.lr_metric = Monitor(name='lr')
 
     @property
     def metrics(self):
-        return [self.d_loss_metric, self.lr_metric]
+        return [
+            self.d_loss_metric,
+            self.e_loss_metric,
+            self.lr_metric,
+        ]
 
     def train_step(self, data):
+        """One-step training logic"""
         img, c = data
         batch_size = tf.shape(img)[0]
-        img = tf.reshape(img, shape=(batch_size, -1), name='flatten_img')
+
+        img = tf.reshape(
+            img,
+            shape=(batch_size, -1),
+            name='flatten_img',
+        )
 
         # Train Discriminator
         z = tf.random.normal(shape=(batch_size, self.z_dim))
@@ -128,44 +159,110 @@ class CGAN(keras.Model):
         labels = tf.concat([fake, real], 0)
         labels += 0.05 * tf.random.uniform(shape=tf.shape(labels))
         with tf.GradientTape() as tape:
+            z_, c_ = self.encoder(img)
             img_ = self.generator([z, c])
-            d_in = tf.concat([img_, img], 0)
             d_in = [
                 tf.concat([img_, img], 0),
-                tf.concat([c, c], 0)
+                tf.concat([z, z_], 0),
+                tf.concat([c, c_], 0),
             ]
             d_out = self.discriminator(d_in)
             d_loss = self.loss_fn(labels, d_out)
 
-        d_grad = tape.gradient(
-            d_loss, self.discriminator.trainable_weights
+        d_gradients = tape.gradient(
+            d_loss, self.discriminator.trainable_variables,
         )
         self.d_optimizer.apply_gradients(
-            zip(d_grad, self.discriminator.trainable_weights)
+            zip(d_gradients, self.discriminator.trainable_variables)
         )
 
-        # Train generator
+        # Train Generator && Encoder
         z = tf.random.normal(shape=(batch_size, self.z_dim))
-        with tf.GradientTape() as tape:
+        with tf.GradientTape(persistent=True) as tape:
+            z_, c_ = self.encoder(img)
             img_ = self.generator([z, c])
-            d_out = self.discriminator([img_, c])
-            g_loss = self.loss_fn(real, d_out)
 
-        g_grad = tape.gradient(
-            g_loss, self.generator.trainable_weights
+            d_out_g = self.discriminator([img_, z, c])
+            d_out_e = self.discriminator([img, z_, c_])
+
+            g_loss = self.loss_fn(real, d_out_g)
+            e_loss = self.loss_fn(fake, d_out_e) + self.gamma * self.efl(c_, c)
+
+        g_gradients = tape.gradient(
+            g_loss, self.generator.trainable_variables,
+        )
+        e_gradients = tape.gradient(
+            e_loss, self.encoder.trainable_variables,
         )
         self.g_optimizer.apply_gradients(
-            zip(g_grad, self.generator.trainable_weights)
+            zip(g_gradients, self.generator.trainable_variables)
+        )
+        self.e_optimizer.apply_gradients(
+            zip(e_gradients, self.encoder.trainable_variables)
         )
 
-        # Metric update
+        # Release object
+        del tape
+
+        # Update metrics
         self.d_loss_metric.update_state(d_loss)
+        self.e_loss_metric.update_state(g_loss)
         self.lr_metric.update_state(self.d_optimizer.learning_rate)
 
         return {
             'd_loss': self.d_loss_metric.result(),
+            'e_loss': self.e_loss_metric.result(),
             'lr': self.lr_metric.result(),
         }
+
+
+def build_encoder(
+    img_shape,
+    n_dim,
+    z_dim,
+    reg = lambda: keras.regularizers.L1L2(l1=0., l2=2.5e-5),
+):
+    """Encoder: z, c = E(x; theta_E)
+
+    Inverse mapping x (image) back to both intrinsic factor z (latent vector)
+    and extrinsic factor c (label)
+
+    WARNING: API is not same as mentioned in paper,  output two factors instead
+    of a concatenated one.
+    """
+    x = keras.layers.Input(shape=(img_shape), name='image')
+    y = keras.layers.Dense(
+        1024,
+        kernel_regularizer=reg(),
+        kernel_initializer=keras.initializers.RandomNormal(
+            mean=0.0, stddev=0.02)
+    )(x)
+    y = keras.layers.LeakyReLU(alpha=0.2)(y)
+    y = keras.layers.Dense(
+        1024,
+        kernel_regularizer=reg(),
+        kernel_initializer=keras.initializers.RandomNormal(
+            mean=0.0, stddev=0.02)
+    )(y)
+    y = keras.layers.LeakyReLU(alpha=0.2)(y)
+    y = keras.layers.BatchNormalization()(y)
+
+    z = keras.layers.Dense(
+        z_dim,
+        kernel_regularizer=reg(),
+        kernel_initializer=keras.initializers.RandomNormal(
+            mean=0.0, stddev=0.02),
+        name='out_z',
+    )(y)
+    c = keras.layers.Dense(
+        n_dim,
+        kernel_regularizer=reg(),
+        kernel_initializer=keras.initializers.RandomNormal(
+            mean=0.0, stddev=0.02),
+        name='out_c',
+    )(y)
+
+    return keras.Model(x, [z, c], name='encoder')
 
 def build_generator(
     img_shape,
@@ -201,8 +298,8 @@ def build_generator(
         kernel_initializer=keras.initializers.RandomNormal(
             mean=0.0, stddev=0.02),
         kernel_regularizer=reg(),
-        name='out',
         activation='tanh',
+        name='out',
     )(y)
     return keras.Model([z, c], x, name='generator')
 
@@ -210,15 +307,21 @@ def build_generator(
 def build_discriminator(
     img_shape,
     n_dim,
+    z_dim,
     reg = lambda: keras.regularizers.L1L2(l1=0., l2=2.5e-5),
 ):
-    """Discriminator: D(x, c; theta_D)
+    """Discriminator: D(x, z, c; theta_D)
 
     Predict whether image x and latent vector is real or fake.
+    No `sigmoid` activation at output layer
+
+    fake: D(G(z_hat), z_hat; theta_D), z_hat = [z c]
+    Real: D(x, E(x); theta_D)
     """
     x = keras.layers.Input(shape=(img_shape,), name='image')
+    z = keras.layers.Input(shape=(z_dim,), name='intrinsic_z')
     c = keras.layers.Input(shape=(n_dim,), name='extrinsic_c')
-    y = keras.layers.Concatenate(axis=-1)([x, c])
+    y = keras.layers.Concatenate(axis=-1)([x, z, c])
 
     y = keras.layers.Dense(
         1024,
@@ -240,14 +343,14 @@ def build_discriminator(
         kernel_initializer=keras.initializers.RandomNormal(
             mean=0.0, stddev=0.02),
         kernel_regularizer=reg(),
-        name='out',
         activation='sigmoid',
+        name='out',
     )(y)
-    return keras.Model([x, c], y, name='discriminator')
+    return keras.Model([x, z, c], [y], name='discriminator')
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Utils
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 def get_mnist(data_dir=_DATADIR, batch_size=128):
     def norm_and_remove(img, label):
         """Normalize to [-1, 1]
@@ -255,9 +358,6 @@ def get_mnist(data_dir=_DATADIR, batch_size=128):
         Args:
             img (tf.Tensor): mnist image tensor
             label (tf.float32): mnist image label
-
-        Returns:
-            img: normalized image
         """
         return (
             (tf.cast(img, tf.float32) - 127.5) / 127.5,
@@ -379,10 +479,12 @@ class LearningRateDecay(keras.callbacks.Callback):
     def on_epoch_begin(self, epoch, logs=None): # pylint: disable=unused-argument
         d_lr = self.model.d_optimizer.learning_rate
         g_lr = self.model.g_optimizer.learning_rate
+        e_lr = self.model.e_optimizer.learning_rate
         if epoch >= self.bound:
             weight = self.decay_rate ** (epoch / self.bound)
             d_lr.assign(self.lr * weight)
             g_lr.assign(self.lr * weight)
+            e_lr.assign(self.lr * weight)
 
 class Monitor(keras.metrics.Metric):
     """Learning rate monitor.
@@ -399,19 +501,15 @@ class Monitor(keras.metrics.Metric):
 
     def reset_state(self):
         self.lr.assign(0.0)
-
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Train && Eval
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 def build_model(argv):
     del argv
-    model = CGAN()
-    model.generator.summary()
-    model.discriminator.summary()
 
 @main
 def run(argv):
-    """Train CGAN on MNIST."""
+    """Train BiGAN on MNIST."""
     del argv
 
     # Environment variable setting
@@ -421,16 +519,18 @@ def run(argv):
 
     logging.set_verbosity(logging.DEBUG)
 
-    model = CGAN()
+    model = BiCoGAN()
 
-    ds_train, _ = get_mnist(batch_size=model.batch_size)
+    x_train, _ = get_mnist(
+        batch_size=model.batch_size
+    )
 
     model.compile(
         run_eagerly=FLAGS.run_eagerly,
     )
 
     model.fit(
-        ds_train,
+        x_train,
         epochs=model.epochs,
         callbacks=model.callbacks,
     )
