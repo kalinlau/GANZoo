@@ -407,11 +407,13 @@ class SaveImage(keras.callbacks.Callback):
         """
         if not tf.math.mod(epoch + 1, self.interval):
             # Latent vector
+            # FIXME: Why use uniform generate better image in eval?
             z = tf.random.uniform(
                 shape=(self.num_img, self.latent_dim),
                 minval=-1.,
-                maxval=1.
+                maxval=1.,
             )
+            # z = tf.random.normal(shape=(self.num_img, self.latent_dim))
             # Label vector
             labels = tf.range(0, 10, dtype=tf.int32)
             labels = tf.reshape(labels, shape=(1, -1))

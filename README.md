@@ -12,3 +12,4 @@ Collection of TF2 and Keras implementation of Generative Adversarial Networks. T
 - [x] [Deep Convolutional GAN (DCGAN)](https://arxiv.org/abs/1511.06434)
 - [x] [Bidirectional GAN (BiGAN)](https://arxiv.org/abs/1605.09782)
 - [x] [Bidirectional Conditional GAN (BiCoGAN)](https://arxiv.org/abs/1711.07461)
+- [x] [Auxiliary Classifier GAN (ACGAN)](https://arxiv.org/abs/1511.05644)
